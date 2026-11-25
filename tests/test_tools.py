@@ -127,6 +127,20 @@ def test_disasm_prefers_the_exact_kernel_and_lists_other_matches(tmp_path: Path,
     assert out["path"].endswith("foo_rows.ptx") and "other_matches" not in out
 
 
+def test_profile_rejects_unknown_ncu_cache_control() -> None:
+    from hotkernel.server import profile
+    out = profile(["python", "t.py"], tool="ncu", ncu_cache_control="some")
+    assert "error" in out and "'all' or 'none'" in out["error"]
+
+
+def test_gpu_runs_take_the_shared_lock_when_set(monkeypatch) -> None:
+    from hotkernel.server import _gpu
+    monkeypatch.delenv("HOTKERNEL_LOCK", raising=False)
+    assert _gpu(["python", "t.py"]) == ["python", "t.py"]
+    monkeypatch.setenv("HOTKERNEL_LOCK", "/tmp/gpu.lock")
+    assert _gpu(["python", "t.py"]) == ["flock", "/tmp/gpu.lock", "python", "t.py"]
+
+
 def test_ncu_details_missing_header(tmp_path: Path) -> None:
     p = tmp_path / "junk.csv"
     p.write_text("nothing,here\n1,2\n")

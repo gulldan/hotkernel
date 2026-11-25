@@ -140,6 +140,13 @@ def _run(cmd: list[str], cwd: str | None = None, timeout: int = _DEFAULT_TIMEOUT
     }
 
 
+def _gpu(cmd: list[str]) -> list[str]:
+    """cmd under `flock $HOTKERNEL_LOCK` when that is set: one lock file that everyone timing on
+    a shared GPU takes, one run at a time, so two people's measurements never overlap."""
+    lock = os.environ.get("HOTKERNEL_LOCK", "").strip()
+    return ["flock", lock, *cmd] if lock else cmd
+
+
 def _last_json_line(text: str) -> dict | None:
     for line in reversed(text.splitlines()):
         line = line.strip()
@@ -283,7 +290,7 @@ def bench(script: str, n: int = 5, args: list[str] | None = None, cwd: str | Non
     oks: list[bool] = []
     raw: list[dict] = []
     for i in range(warmup + n):
-        r = _run(cmd, cwd=cwd, timeout=timeout)
+        r = _run(_gpu(cmd), cwd=cwd, timeout=timeout)
         if "error" in r:
             return r
         if r["returncode"] != 0:
@@ -378,7 +385,7 @@ def torch_trace(script: str, top: int = 15, args: list[str] | None = None,
     try:
         # Targets skip their L2-flush scaffolding under this variable so it does not show up
         # as the top kernel; timing tools (bench, verify) never set it.
-        r = _run([py, runner, script, str(top), *(args or [])], cwd=cwd, timeout=timeout,
+        r = _run(_gpu([py, runner, script, str(top), *(args or [])]), cwd=cwd, timeout=timeout,
                  env={"HOTKERNEL_NO_FLUSH": "1"})
     finally:
         try:
@@ -406,11 +413,17 @@ def torch_trace(script: str, top: int = 15, args: list[str] | None = None,
 @mcp.tool()
 def profile(cmd: list[str], tool: str = "nsys", out_dir: str = "results/profiles",
             cwd: str | None = None, timeout: int = _DEFAULT_TIMEOUT,
-            ncu_kernel_regex: str = "", ncu_launch_count: int = 20) -> dict:
+            ncu_kernel_regex: str = "", ncu_launch_count: int = 20,
+            ncu_cache_control: str = "all") -> dict:
     """Run a command under Nsight Systems (tool='nsys') or Nsight Compute (tool='ncu') and
     return the path of the report plus a parsed kernel summary. nsys gives the per-kernel time
     breakdown; ncu gives per-kernel metrics (achieved occupancy, DRAM throughput, SM throughput)
-    and is much slower, so use ncu_kernel_regex to target one kernel."""
+    and is much slower, so use ncu_kernel_regex to target one kernel. ncu_cache_control: 'all'
+    (ncu's default) flushes the caches before every replay pass, a cold-cache view; 'none'
+    leaves them as the previous pass did, a warm-L2 view, as when the kernel's input was
+    written just before. Neither is a steady stream: time a streaming kernel with verify()."""
+    if ncu_cache_control not in ("all", "none"):
+        return {"error": f"ncu_cache_control must be 'all' or 'none', got {ncu_cache_control!r}"}
     # out_dir is relative to cwd (the directory the command runs in); report paths come back
     # absolute so the agent can pass them straight to top_kernels() or read them.
     cwd, out_dir = _local_path(cwd), _local_path(out_dir) or out_dir
@@ -425,8 +438,8 @@ def profile(cmd: list[str], tool: str = "nsys", out_dir: str = "results/profiles
         if isinstance(exe, dict):
             return exe
         rep = str(out / f"nsys-{stamp}")
-        r = _run([exe, "profile", "--trace=cuda,nvtx", "--sample=none", "--cpuctxsw=none",
-                  "-o", rep, "--force-overwrite", "true", *cmd], cwd=cwd, timeout=timeout,
+        r = _run(_gpu([exe, "profile", "--trace=cuda,nvtx", "--sample=none", "--cpuctxsw=none",
+                       "-o", rep, "--force-overwrite", "true", *cmd]), cwd=cwd, timeout=timeout,
                  env={"HOTKERNEL_NO_FLUSH": "1"})  # see torch_trace
         if "error" in r or r["returncode"] != 0:
             return {"error": "nsys profile failed", "detail": r}
@@ -458,10 +471,10 @@ def profile(cmd: list[str], tool: str = "nsys", out_dir: str = "results/profiles
             return exe
         rep = str(out / f"ncu-{stamp}")
         ncu_cmd = [exe, "--set", "basic", "--launch-count", str(ncu_launch_count),
-                   "-o", rep, "--force-overwrite"]
+                   "--cache-control", ncu_cache_control, "-o", rep, "--force-overwrite"]
         if ncu_kernel_regex:
             ncu_cmd += ["--kernel-name", f"regex:{ncu_kernel_regex}"]
-        r = _run([*ncu_cmd, *cmd], cwd=cwd, timeout=timeout, env={"HOTKERNEL_NO_FLUSH": "1"})
+        r = _run(_gpu([*ncu_cmd, *cmd]), cwd=cwd, timeout=timeout, env={"HOTKERNEL_NO_FLUSH": "1"})
         if "error" in r:
             return r
         if "ERR_NVGPUCTRPERM" in (r["stdout"] + r["stderr"]):
@@ -738,7 +751,7 @@ def _nvidia_smi_state() -> dict:
 def _run_target(cmd: list[str], cwd: str | None, timeout: int) -> dict:
     """One run of a contract script. A JSON line with ok=false and a non-zero exit is a valid
     'incorrect' result, not a crash; no JSON line at all is an error."""
-    r = _run(cmd, cwd=cwd, timeout=timeout)
+    r = _run(_gpu(cmd), cwd=cwd, timeout=timeout)
     if "error" in r:
         return r
     j = _last_json_line(r["stdout"])
