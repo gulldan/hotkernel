@@ -27,6 +27,7 @@ from __future__ import annotations
 import csv
 import functools
 import glob
+import hashlib
 import io
 import json
 import math
@@ -370,6 +371,32 @@ print("HOTKERNEL_JSON " + json.dumps({
 '''
 
 
+_PROFILED_RUNNER = r'''
+# Runs a script as __main__ for profile(). Python's platform.architecture() shells out to
+# `file`, and under Nsight Systems' injection `file` can hang for good (seen on Linux with
+# nsys 2026.5.2 and a torch 2.11 + Triton 3.6 script), leaving nsys waiting on it. The answer
+# is the interpreter's own pointer size, so give it without the subprocess.
+import os, platform, runpy, struct, sys
+platform.architecture = lambda *a, **k: (f"{8 * struct.calcsize('P')}bit", "ELF")
+script = sys.argv[1]
+sys.argv = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+runpy.run_path(script, run_name="__main__")
+'''
+
+
+def _profiled(cmd: list[str]) -> list[str]:
+    """[python, script.py, ...] -> [python, runner, script.py, ...] (see _PROFILED_RUNNER);
+    other commands (python -c, python -m, binaries) are left alone."""
+    if len(cmd) < 2 or not cmd[1].endswith(".py"):
+        return cmd
+    digest = hashlib.sha256(_PROFILED_RUNNER.encode()).hexdigest()[:12]
+    runner = Path(tempfile.gettempdir()) / f"hotkernel_profiled_{digest}.py"
+    if not runner.exists():
+        runner.write_text(_PROFILED_RUNNER)
+    return [cmd[0], str(runner), *cmd[1:]]
+
+
 @mcp.tool()
 def torch_trace(script: str, top: int = 15, args: list[str] | None = None,
                 cwd: str | None = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
@@ -428,7 +455,7 @@ def profile(cmd: list[str], tool: str = "nsys", out_dir: str = "results/profiles
     # absolute so the agent can pass them straight to top_kernels() or read them.
     cwd, out_dir = _local_path(cwd), _local_path(out_dir) or out_dir
     if cmd and cmd[0] in ("python", "python3", "py"):
-        cmd = [_python(), *cmd[1:]]  # the interpreter that has the user's torch, not PATH's
+        cmd = _profiled([_python(), *cmd[1:]])  # the user's torch, not PATH's; see _profiled
     base = Path(cwd) if cwd else Path.cwd()
     out = Path(out_dir) if Path(out_dir).is_absolute() else base / out_dir
     out.mkdir(parents=True, exist_ok=True)

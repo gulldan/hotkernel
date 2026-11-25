@@ -141,6 +141,28 @@ def test_gpu_runs_take_the_shared_lock_when_set(monkeypatch) -> None:
     assert _gpu(["python", "t.py"]) == ["flock", "/tmp/gpu.lock", "python", "t.py"]
 
 
+def test_profiled_runner_runs_scripts_without_calling_file(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    from hotkernel.server import _profiled
+    assert _profiled(["py", "-c", "pass"]) == ["py", "-c", "pass"]
+    script = tmp_path / "target.py"
+    script.write_text(
+        "import json, platform, subprocess, sys\n"
+        "def no_file(*a, **k):\n"
+        "    raise AssertionError('platform.architecture shelled out')\n"
+        "subprocess.Popen = no_file\n"
+        "print(json.dumps([__name__, sys.argv, platform.architecture()[0]]))\n"
+        "sys.exit(3)\n")
+    cmd = _profiled([sys.executable, str(script), "--n", "5"])
+    assert cmd[0] == sys.executable and cmd[2:] == [str(script), "--n", "5"]
+    r = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 3, r.stderr  # the target's exit code survives
+    name, argv, bits = json.loads(r.stdout)
+    assert name == "__main__" and argv == [str(script), "--n", "5"] and bits.endswith("bit")
+
+
 def test_ncu_details_missing_header(tmp_path: Path) -> None:
     p = tmp_path / "junk.csv"
     p.write_text("nothing,here\n1,2\n")
