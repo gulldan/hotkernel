@@ -103,12 +103,21 @@ class Target:
     outside the timed region. With derive, min_bytes should state the bytes one call must read
     (one weight layout, not every layout derive returns); the rotation K is sized from it so
     that every implementation streams more than 2 x L2 per cycle.
+
+    exact (optional): the output must equal the reference bit for bit (dtype, shape and every
+    byte, so NaN payloads and -0.0 count); rtol and atol are then ignored. For kernels that must
+    reproduce a library or a CPU path exactly.
+
+    cases (optional): a function returning a list of input tuples, in call order, that fn must
+    also get right before it is timed: odd sizes, tails, strided views, the edge cases one
+    random input set does not reach. Checked with the same rule as the main input.
     """
 
     def __init__(self, name: str, dtype, shapes: dict[str, tuple[int, ...]], rotate: tuple[str, ...],
                  reference, rtol: float | None = None, atol: float | None = None, iters: int = 50,
                  seed: int = 0, flops: int | None = None, min_bytes: int | None = None,
-                 reference_name: str = "reference", derive=None, derive_name: str | None = None):
+                 reference_name: str = "reference", derive=None, derive_name: str | None = None,
+                 exact: bool = False, cases=None):
         self.name = name
         self.dtype = parse_dtype(dtype)
         self.shapes = {k: tuple(int(d) for d in v) for k, v in shapes.items()}
@@ -128,6 +137,15 @@ class Target:
         self.derive = derive
         self.derive_name = derive_name or (getattr(derive, "__name__", "derive") if derive else None)
         self.input_names: list[str] = list(self.shapes)  # replaced by derive's keys on first use
+        self.exact = bool(exact)
+        self.cases = cases
+
+    def matches(self, out: torch.Tensor, ref: torch.Tensor) -> bool:
+        if self.exact:
+            return (out.dtype == ref.dtype and out.shape == ref.shape and torch.equal(
+                out.contiguous().reshape(-1).view(torch.uint8),
+                ref.contiguous().reshape(-1).view(torch.uint8)))
+        return bool(torch.allclose(out.float(), ref.float(), rtol=self.rtol, atol=self.atol))
 
     @property
     def primary(self) -> str:
@@ -171,7 +189,12 @@ class Target:
 
         out = fn(*inputs[0])
         ref = self.reference(*inputs[0])
-        ok = bool(torch.allclose(out.float(), ref.float(), rtol=self.rtol, atol=self.atol))
+        ok = self.matches(out, ref)
+        cases = list(self.cases()) if self.cases is not None else []
+        failed_case = next((i for i, case in enumerate(cases)
+                            if not self.matches(fn(*case), self.reference(*case))), None)
+        ok = ok and failed_case is None
+        del cases
         if self.derive is not None:  # what actually differs between sets after derive()
             rotated_bytes = sum(_nbytes(a) for a, b in zip(inputs[0], inputs[1], strict=True) if a is not b)
         pair_bytes = rotated_bytes + _nbytes(out)
@@ -202,6 +225,10 @@ class Target:
             line["inputs"] = list(self.input_names)
         if self.flops is not None:
             line["flops"] = self.flops
+        if self.exact:
+            line["exact"] = True
+        if self.cases is not None:
+            line["cases_failed_at"] = failed_case  # index into cases(); None = all passed
         line.update(extra or {})
         print(json.dumps(line))
         sys.exit(0 if ok else 1)

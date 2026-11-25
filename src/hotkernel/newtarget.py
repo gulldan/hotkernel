@@ -111,6 +111,7 @@ ROTATE = {rotate}  # streamed inputs that get K distinct copies (> 2x L2 in tota
 {derive_consts}ITERS = {iters}
 SEED = {seed}
 RTOL, ATOL = {rtol}, {atol}  # None = default for DTYPE (see DEFAULT_TOLERANCES in the contract)
+EXACT = {exact}  # True: the output must match the reference bit for bit; RTOL, ATOL unused
 FLOPS = {flops}  # nominal flops per call for roofline(); None = not stated
 
 assert PROTOCOL == {protocol}, "contract file does not match the protocol this target was generated for"
@@ -121,7 +122,7 @@ def reference({params}):
 
 
 TARGET = Target(name={target!r}, dtype=DTYPE, shapes=SHAPES, rotate=ROTATE, reference=reference,
-                rtol=RTOL, atol=ATOL, iters=ITERS, seed=SEED, flops=FLOPS{min_bytes_kw},
+                rtol=RTOL, atol=ATOL, exact=EXACT, iters=ITERS, seed=SEED, flops=FLOPS{min_bytes_kw},
                 reference_name={refname!r}{derive_kw})
 
 
@@ -207,7 +208,8 @@ def new_target(target: str, from_: str, shape: str, dtype: str = "bf16",
                out_dir: str = ".", flops: int | None = None, iters: int = 50, seed: int = 0,
                rtol: float | None = None, atol: float | None = None, force: bool = False,
                reference: str | None = None, derive: str | None = None,
-               inputs: str | list[str] | None = None, min_bytes: int | None = None) -> dict:
+               inputs: str | list[str] | None = None, min_bytes: int | None = None,
+               exact: bool = False) -> dict:
     """Write the three files and return what was written plus the next commands. Errors come
     back as {"error": ...} so an agent can read them. `reference` names a different function
     (module:function or file.py:function) to run in fp32 as the reference, for baselines that
@@ -289,7 +291,7 @@ def new_target(target: str, from_: str, shape: str, dtype: str = "bf16",
         derive_binding=derive_binding, dtype=dtype,
         shapes="{" + ", ".join(f"{n!r}: {s!r}" for n, s in shapes.items()) + "}", shapes_note=shapes_note,
         rotate=repr(tuple(rotate_names)), derive_consts=derive_consts, iters=int(iters), seed=int(seed),
-        rtol=repr(rtol), atol=repr(atol), flops=repr(None if flops is None else int(flops)),
+        rtol=repr(rtol), atol=repr(atol), exact=repr(bool(exact)), flops=repr(None if flops is None else int(flops)),
         params=params, args=args, cast=cast, refname=refname,
         min_bytes_kw=", min_bytes=MIN_BYTES" if "MIN_BYTES" in derive_consts else "", derive_kw=derive_kw)
     candidate_text = _CANDIDATE.format(target=target, params=params)
@@ -336,6 +338,8 @@ def build_parser(prog: str = "hotkernel new") -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--rtol", type=float, default=None, help="override the dtype default")
     p.add_argument("--atol", type=float, default=None, help="override the dtype default")
+    p.add_argument("--exact", action="store_true",
+                   help="require bit-for-bit equality with the reference (tolerances unused)")
     p.add_argument("--reference", default=None, metavar="MODULE:FUNCTION",
                    help="a different function to run in fp32 as the reference (default: the "
                         "baseline itself); for baselines that cannot run in fp32")
@@ -357,7 +361,7 @@ def main(argv: list[str]) -> int:
     result = new_target(args.target, args.from_, args.shape, args.dtype, args.extra, args.rotate,
                         args.out, args.flops, args.iters, args.seed, args.rtol, args.atol, args.force,
                         reference=args.reference, derive=args.derive, inputs=args.inputs,
-                        min_bytes=args.min_bytes)
+                        min_bytes=args.min_bytes, exact=args.exact)
     print(json.dumps(result, indent=1))
     return 1 if "error" in result else 0
 

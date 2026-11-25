@@ -334,6 +334,53 @@ def test_examples_vendor_the_same_contract() -> None:
     assert "import hotkernel" not in contract_source()  # runs where hotkernel is not installed
 
 
+def _contract_module():
+    """The vendored contract imported as a module (it needs torch, not a GPU, to load)."""
+    import importlib.util
+    pytest.importorskip("torch")
+    spec = importlib.util.spec_from_file_location(
+        "_hk_contract", REPO / "src" / "hotkernel" / "templates" / "contract.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_contract_exact_mode_compares_bits() -> None:
+    c = _contract_module()
+    import torch
+
+    def target(**kw):
+        return c.Target(name="t", dtype="fp32", shapes={"x": (4,)}, rotate=("x",),
+                        reference=lambda x: x, **kw)
+
+    loose, exact = target(), target(exact=True)
+    b = torch.tensor([1.0, 2.0, 3.0])
+    nudged = b.clone()
+    nudged[2] = torch.nextafter(nudged[2], torch.tensor(4.0))
+    assert loose.matches(nudged, b) and not exact.matches(nudged, b)  # one ulp
+    a = torch.tensor([1.0, -0.0, float("nan"), 3.0])
+    assert exact.matches(a.clone(), a)  # same NaN payload, same signed zero
+    zero = a.clone()
+    zero[1] = 0.0
+    assert not exact.matches(zero, a)  # -0.0 is not 0.0 bit for bit
+    assert not exact.matches(a.double(), a.double().float())  # dtype must match too
+    u8 = torch.arange(256, dtype=torch.uint8).reshape(16, 16)
+    assert exact.matches(u8.t().contiguous().t(), u8)  # layout does not matter, values do
+
+
+def test_new_target_exact_flag(tmp_path: Path) -> None:
+    from hotkernel.newtarget import build_parser, new_target
+    r = new_target("cvt", "torch:relu", "16", dtype="fp32", out_dir=str(tmp_path), exact=True)
+    assert "error" not in r, r
+    baseline = Path(r["files"]["baseline"]).read_text(encoding="utf-8")
+    ast.parse(baseline)
+    assert "EXACT = True" in baseline and "exact=EXACT" in baseline
+    plain = new_target("cvt2", "torch:relu", "16", out_dir=str(tmp_path))
+    assert "EXACT = False" in Path(plain["files"]["baseline"]).read_text(encoding="utf-8")
+    args = build_parser().parse_args(["cvt", "--from", "torch:relu", "--shape", "16", "--exact"])
+    assert args.exact is True
+
+
 def test_new_target_scaffolds_three_files(tmp_path: Path) -> None:
     from hotkernel.newtarget import new_target
     r = new_target("gelu", "torch.nn.functional:gelu", "4096x8192", dtype="bf16", out_dir=str(tmp_path))
