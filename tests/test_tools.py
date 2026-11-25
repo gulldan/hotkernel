@@ -10,12 +10,21 @@ from __future__ import annotations
 import ast
 import glob
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from hotkernel import gpus
-from hotkernel.server import _decide, _last_json_line, _short_kernel_name, record, top_kernels
+from hotkernel.server import (
+    _decide,
+    _last_json_line,
+    _ncu_report,
+    _short_kernel_name,
+    disasm,
+    record,
+    top_kernels,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -74,6 +83,50 @@ def test_ncu_details_parse(tmp_path: Path) -> None:
     assert second["bound_hint"].startswith("latency")
 
 
+def test_ncu_bound_hint_names_a_saturated_cache(tmp_path: Path) -> None:
+    # Byte loads and strided byte stores: L2 at 80% while DRAM and SM stay low.
+    name, sol = "nv12_kernel", "GPU Speed Of Light Throughput"
+    p = tmp_path / "ncu.details.csv"
+    p.write_text("\n".join([
+        _NCU_HEADER,
+        _ncu_row("0", name, sol, "Duration", "us", "12.70"),
+        _ncu_row("0", name, sol, "DRAM Throughput", "%", "25.11"),
+        _ncu_row("0", name, sol, "Compute (SM) Throughput", "%", "34.12"),
+        _ncu_row("0", name, sol, "L1/TEX Cache Throughput", "%", "39.23"),
+        _ncu_row("0", name, sol, "L2 Cache Throughput", "%", "80.01"),
+    ]) + "\n")
+    (kernel,) = top_kernels(str(p), 10, tool="ncu")["kernels"]
+    assert kernel["bound_hint"] == "memory (L2 80%)"
+
+
+def test_ncu_report_accepts_compressed_reports(tmp_path: Path) -> None:
+    rep = str(tmp_path / "ncu-20261125-112406")
+    assert _ncu_report(rep) is None
+    Path(rep + ".ncu-repz").write_bytes(b"")  # what Nsight Compute 2026.3 writes
+    assert _ncu_report(rep) == rep + ".ncu-repz"
+    Path(rep + ".ncu-rep").write_bytes(b"")
+    assert _ncu_report(rep) == rep + ".ncu-rep"
+
+
+def test_disasm_prefers_the_exact_kernel_and_lists_other_matches(tmp_path: Path,
+                                                                  monkeypatch) -> None:
+    def cached(directory: str, name: str, mtime: int) -> Path:
+        p = tmp_path / directory / f"{name}.ptx"
+        p.parent.mkdir()
+        p.write_text(f"// {directory}/{name}\n")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    old = cached("a", "foo", 100)
+    cached("b", "foo_rows", 300)  # newest, but only contains the name
+    new = cached("c", "foo", 200)  # another specialization of foo
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    out = disasm("triton-cache", level="ptx", kernel="foo")
+    assert out["path"] == str(new) and out["other_matches"] == [str(old)]
+    out = disasm("triton-cache", level="ptx", kernel="foo_r")
+    assert out["path"].endswith("foo_rows.ptx") and "other_matches" not in out
+
+
 def test_ncu_details_missing_header(tmp_path: Path) -> None:
     p = tmp_path / "junk.csv"
     p.write_text("nothing,here\n1,2\n")
@@ -95,7 +148,7 @@ def test_ncu_real_report_if_present() -> None:
                 "registers_per_thread", "theoretical_occupancy_pct"):
         assert key in m, key
     assert 0 <= m["dram_throughput_pct"] <= 100 and 0 <= m["achieved_occupancy_pct"] <= 100
-    assert top["bound_hint"] in ("memory", "compute") or top["bound_hint"].startswith("latency")
+    assert top["bound_hint"].startswith(("memory", "compute", "latency"))
     assert len(top["name"]) <= 160
 
 

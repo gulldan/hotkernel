@@ -482,23 +482,30 @@ def profile(cmd: list[str], tool: str = "nsys", out_dir: str = "results/profiles
                 "fallback": "profile(tool='nsys') and torch_trace work without this permission.",
                 "detail": r,
             }
-        if r["returncode"] != 0 or not Path(rep + ".ncu-rep").exists():
+        report = _ncu_report(rep)
+        if r["returncode"] != 0 or report is None:
             return {"error": "ncu failed", "detail": r}
         # --log-file makes ncu write the CSV itself; a details page is one row per metric per
         # launch (hundreds of KB for a few launches) and would not survive the stdout tail.
         csv_path = rep + ".details.csv"
-        imp = _run([exe, "--import", rep + ".ncu-rep", "--csv", "--page", "details",
+        imp = _run([exe, "--import", report, "--csv", "--page", "details",
                     "--log-file", csv_path], cwd=cwd, timeout=timeout)
         if "error" in imp or imp["returncode"] != 0 or not Path(csv_path).exists():
-            return {"error": "ncu --import failed", "detail": imp, "report": rep + ".ncu-rep"}
+            return {"error": "ncu --import failed", "detail": imp, "report": report}
         parsed = top_kernels(csv_path, 10, tool="ncu")
-        return {"tool": "ncu", "report": rep + ".ncu-rep", "details_csv": csv_path,
+        return {"tool": "ncu", "report": report, "details_csv": csv_path,
                 "top": parsed.get("kernels"), "parse_error": parsed.get("error"),
                 "note": "the target ran with HOTKERNEL_NO_FLUSH=1 and ncu replays each kernel "
                         "with its own cache control, so duration_us here is not comparable with "
                         "bench()/verify() (which flush L2 before every call); use ncu for "
                         "throughput %, occupancy and registers, verify() for time"}
     return {"error": f"unknown tool '{tool}', use 'nsys' or 'ncu'"}
+
+
+def _ncu_report(rep: str) -> str | None:
+    """The report `ncu -o rep` wrote: .ncu-rep, or .ncu-repz (Nsight Compute 2026.3 compresses)."""
+    return next((rep + ext for ext in (".ncu-rep", ".ncu-repz") if Path(rep + ext).exists()),
+                None)
 
 
 def _num(s: str | None) -> float | None:
@@ -629,8 +636,16 @@ def _top_kernels_ncu(p: Path, n: int) -> dict:
         m = k["metrics"]
         dram, sm = m.get("dram_throughput_pct"), m.get("sm_throughput_pct")
         if dram is not None and sm is not None:
-            k["bound_hint"] = ("memory" if dram >= sm else "compute") if max(dram, sm) >= 60 \
-                else "latency (neither DRAM nor SM above 60% of peak)"
+            # The busiest memory unit, not DRAM alone: narrow accesses can saturate L2 or L1.
+            units = {"DRAM": dram, "L2": m.get("l2_throughput_pct"),
+                     "L1": m.get("l1_throughput_pct")}
+            unit, mem = max(((u, v) for u, v in units.items() if v is not None), key=lambda x: x[1])
+            if max(mem, sm) < 60:
+                k["bound_hint"] = "latency (neither memory nor SM above 60% of peak)"
+            elif mem < sm:
+                k["bound_hint"] = "compute"
+            else:
+                k["bound_hint"] = "memory" if unit == "DRAM" else f"memory ({unit} {mem:.0f}%)"
     return {"tool": "ncu", "source": str(p), "n_launches": len(launches), "kernels": out,
             "hints_note": "`hints` are ncu's own rules with its estimated speedups; the estimates "
                           "assume the named limiter is the only one and run high for "
@@ -658,9 +673,12 @@ def top_kernels(summary_csv: str, n: int = 10, tool: str = "nsys") -> dict:
 @mcp.tool()
 def disasm(target: str, level: str = "sass", kernel: str = "", max_lines: int = 1500) -> dict:
     """Disassemble a kernel. target is a .cubin/.ptx/.so/.exe path, or 'triton-cache' to search
-    ~/.triton/cache (and TRITON_CACHE_DIR) for the most recent kernel whose name contains
-    `kernel`. level: 'sass' (via cuobjdump -sass) or 'ptx' (cuobjdump -ptx / the .ptx file).
+    ~/.triton/cache (and TRITON_CACHE_DIR) for the most recent kernel named `kernel` (or, if
+    none is, whose name contains it). Other matches, such as other specializations of the
+    same kernel, come back newest first in `other_matches`; pass one as target to read it.
+    level: 'sass' (via cuobjdump -sass) or 'ptx' (cuobjdump -ptx / the .ptx file).
     A real kernel is 500-3000 SASS lines; max_lines<=0 returns all of them."""
+    others: list[str] = []
     if target == "triton-cache":
         roots = [Path(os.environ.get("TRITON_CACHE_DIR", Path.home() / ".triton" / "cache"))]
         cands: list[Path] = []
@@ -668,10 +686,13 @@ def disasm(target: str, level: str = "sass", kernel: str = "", max_lines: int = 
             if root.exists():
                 ext = "*.cubin" if level == "sass" else "*.ptx"
                 cands += [p for p in root.rglob(ext) if kernel in p.stem]
+        # An exact name wins over a longer one that contains it (foo vs foo_rows).
+        cands = [p for p in cands if p.stem == kernel] or cands
         if not cands:
             return {"error": f"no cached Triton {level} found for kernel '{kernel}'",
                     "searched": [str(r) for r in roots]}
-        path = max(cands, key=lambda p: p.stat().st_mtime)
+        cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        path, others = cands[0], [str(p) for p in cands[1:]]
     else:
         path = Path(_local_path(target) or target)
         if not path.exists():
@@ -694,7 +715,10 @@ def disasm(target: str, level: str = "sass", kernel: str = "", max_lines: int = 
             "text": "\n".join(lines[:keep]),
             "truncated": len(lines) > keep,
             **({"note": f"showing {keep} of {len(lines)} lines; pass max_lines=0 for all"}
-               if len(lines) > keep else {})}
+               if len(lines) > keep else {}),
+            **({"other_matches": others,
+                "match_note": "several cached kernels match; this is the newest, pass another "
+                              "path as target to read it"} if others else {})}
 
 
 # --------------------------------------------------------------------------- verify / record
