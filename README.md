@@ -52,6 +52,8 @@ hotkernel new gelu --from torch.nn.functional:gelu --shape 4096x8192 --dtype bf1
 
 writes `targets/gelu_baseline.py`, `targets/gelu_candidate.py` (starts as the baseline; this is the file the loop edits) and `targets/_hotkernel_contract.py`. A function of your own works the same way, with extra inputs in call order: `--from ./mykernels.py:fused --extra w:8192`. Then `bench` the baseline for the number to beat, and `verify` the untouched candidate against it, which must come back `inconclusive` before anything changed. Agents get the same through the `new_target` tool. On the reference card the untouched gelu candidate benched at 0.0952 ms and verified `inconclusive`; a deliberately wrong one came back `incorrect`.
 
+For a kernel that must reproduce a library or a CPU path bit for bit, add `--exact`: the baseline then compares dtype, shape and every byte instead of using tolerances. To cover what one random input set never reaches (odd sizes, tails, strided views), give the baseline's `Target` a `cases=` function returning more input tuples; a candidate that fails any of them prints `ok: false` with the index in `cases_failed_at`.
+
 ## Before / after
 
 All rows: RTX 5090 @ 575 W, bf16, timing protocol 3, n=7 per `verify()`; rows with a win are three independent reproductions.
@@ -115,6 +117,7 @@ LLMs writing CUDA kernels have a credibility problem: the AI CUDA Engineer claim
 - **WSL2 is the reference platform.** All nine tools are verified on an RTX 5090 under WSL2 Ubuntu 24.04, driver 617.42: `nsys` 2026.1.3 and `ncu` 2026.2.1 extracted into user space from NVIDIA's apt repo (no sudo), `cuobjdump` and `nvdisasm` straight from the Triton wheel (no CUDA toolkit needed). `ncu` needs the GPU performance-counter permission once (NVIDIA Control Panel, Developer settings). Versions, commands and raw outputs: [`docs/platform-matrix.md`](https://github.com/xinhuagu/hotkernel/blob/main/docs/platform-matrix.md).
 - **Native Windows:** the server runs (pure Python). If your torch lives in WSL2, start the server through `wsl.exe`; the platform matrix has the exact `claude mcp add` line.
 - **Triton on RTX 50 series:** FlashAttention 2/3/4 do not run on sm_120, which is exactly why hand-tuned Triton kernels matter on these cards.
+- **GPU on another machine:** the server talks MCP over stdio, so ssh carries it: `claude mcp add hotkernel -- ssh <gpu-host> env HOTKERNEL_PYTHON=<python with torch> <path>/hotkernel`. Every path in a tool call is then a path on that host, and the target files live there. Checked with an RTX 4090 host, see [`docs/platform-matrix.md`](https://github.com/xinhuagu/hotkernel/blob/main/docs/platform-matrix.md#second-machine-rtx-4090-on-linux-2026-11-25).
 - **One GPU, several people or agents:** set `HOTKERNEL_LOCK` to a lock file they all use. Every `bench`, `verify`, `profile` and `torch_trace` run then goes through `flock` on it, one run at a time, so nobody times their kernel while someone else's runs (Linux; `flock` is in util-linux).
 
 ## License

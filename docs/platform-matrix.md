@@ -71,6 +71,41 @@ GDDR7 streaming ceiling on this card. `roofline(..., measured_mem_gbs=1501)` ret
 `attainable_ms_measured` (0.0894 ms for 134 MB), the floor a kernel can realistically be
 within 10% of; the spec-sheet `attainable_ms` stays as the theoretical bound.
 
+## Second machine: RTX 4090 on Linux (2026-11-25)
+
+| | |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090, 24 GB, compute capability 8.9 (sm_89), power limit 450 W, 72 MB L2. Shared with other workloads; timed runs were serialized with `HOTKERNEL_LOCK` |
+| Driver | 615.78 |
+| Host | Linux, Python 3.12, torch 2.11.0+cu128, Triton 3.6.0 |
+| Nsight | `nsys` 2026.5.2 on the host; `nsys` 2026.5.1 and `ncu` 2026.3.0 in a container |
+
+| Tool | Result | Notes |
+|---|---|---|
+| MCP server over ssh | **Works.** | `ssh <host> env HOTKERNEL_PYTHON=... <venv>/bin/hotkernel` as the server command: `initialize`, `tools/list` (10 tools) and `gpu_info` answered from the remote card. |
+| `bench`, `verify`, `record` | **Works.** | An NV12 -> BGR uint8 kernel as an `exact=True` target with two `cases` (an odd 257x319 frame, 1080p planes with a 2048-byte row pitch): the unchanged candidate came back `inconclusive`; a candidate that ignored the row pitch passed the main input and came back `incorrect` with `cases_failed_at: 1`. |
+| `profile` (nsys, host) | **Works**, with the Python runner. | Before it, `platform.architecture()` in the target hung on its `file` subprocess under nsys, and nsys outlived a 60 s `timeout`. |
+| `profile` (ncu) | **Works as root** in a container started with `--cap-add SYS_ADMIN`. | The driver restricts the counters to admins (`RmProfilingAdminOnly=1`); a non-root user inside the same container still gets `ERR_NVGPUCTRPERM`. ncu 2026.3 writes `.ncu-repz` reports. |
+| `disasm` | **Works.** | `cuobjdump` from the Triton wheel. |
+
+**Calibration** (`examples/copy_calibration.py`, protocol 3, 134 MB per call, spec floor
+0.1332 ms at 1008 GB/s):
+
+| kernel | K=2 | K=4 | % of 1008 GB/s |
+|---|---|---|---|
+| torch clone (device memcpy) | 0.1463 ms, 917 GB/s | 0.1536 ms, 874 GB/s | 91 / 87 |
+| torch add(0) (elementwise) | 0.1470 ms, 913 GB/s | 0.1525 ms, 880 GB/s | 91 / 87 |
+| Triton copy, one row per program | 0.1550 ms, 866 GB/s | 0.1549 ms, 866 GB/s | 86 / 86 |
+| torch sum (read only, 67 MB) | 0.0745 ms, 901 GB/s | 0.0755 ms, 889 GB/s | 89 / 88 |
+| Triton row sum (read only) | 0.0716 ms, 938 GB/s | 0.0729 ms, 921 GB/s | 93 / 91 |
+
+GDDR6X streams closer to its spec sheet than the 5090's GDDR7: `roofline(...,
+measured_mem_gbs=917)` for this card. The same timer's caveat shows up at the other end of the
+size range: for a kernel of ~12 us (nsys) the per-call time was 19-20 us, the rest being the
+Python launch and the output allocation. `verify()` still caught a candidate whose kernel was
+3.9 us slower, but reported it as 0.8 us slower: the launch cost differed too (fewer
+arguments), and a change to the launch alone moves the number as much as a change to the kernel.
+
 ## Registering the server in Claude Code on this machine
 
 Claude Code runs on Windows; the torch env and the Triton tools live in WSL2, so the server is
