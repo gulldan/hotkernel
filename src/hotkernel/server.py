@@ -12,6 +12,7 @@ can read them instead of crashing):
   disasm        PTX/SASS for a cubin/ptx file or a Triton-cache kernel via cuobjdump/nvdisasm
   verify        baseline vs candidate, interleaved, n runs each: speedup + verdict
                 (faster / slower / inconclusive / incorrect / invalid)
+  compare_hub   benchmark pinned Hugging Face kernels and compare their warmed CUDA traces
   record        write a verify result to results/<target>/ and append the LEADERBOARD row
   new_target    scaffold baseline + blank candidate + vendored contract from the user's function
 
@@ -53,7 +54,8 @@ _INSTRUCTIONS = (
     "kernel, roofline to classify it, disasm('triton-cache', kernel=...) to read its SASS. "
     "bench and torch_trace run the script with HOTKERNEL_PYTHON (your torch/Triton "
     "interpreter). profile needs nsys/ncu on PATH; without them use torch_trace. Every "
-    "timing carries n/mean/std; report speedups only against the repo baseline."
+    "timing carries n/mean/std; report speedups only against the measured baseline. "
+    "For supported operations, compare_hub tries ready Hugging Face kernels first."
 )
 try:
     mcp = _Server("hotkernel", version=__version__, instructions=_INSTRUCTIONS)
@@ -316,13 +318,36 @@ sys.argv = [script] + sys.argv[3:]
 # `python script.py` puts the script's directory first on sys.path; runpy does not. Targets
 # import their sibling baseline / _timing module, so do the same here.
 sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
+activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
 exit_code = 0
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-    try:
-        runpy.run_path(script, run_name="__main__")
-    except SystemExit as e:  # targets end with sys.exit(0 if ok else 1); keep profiling output
-        exit_code = int(e.code or 0) if isinstance(e.code, int) or e.code is None else 1
+steps = None
+if os.environ.get("HOTKERNEL_TRACE_WARM") == "1":
+    target = runpy.run_path(script)
+    if "prepare_profile" in target:
+        call = target["prepare_profile"]()
+    else:
+        stem = os.path.splitext(os.path.basename(script))[0]
+        fn = target.get("profile_fn") or target.get("baseline_fn") or target.get(stem)
+        fixture = target.get("TARGET")
+        if not callable(fn) or not callable(getattr(fixture, "make_inputs", None)):
+            raise ValueError("A warm trace needs TARGET and a target function or prepare_profile()")
+        inputs = fixture.make_inputs(1)[0]
+        call = lambda: fn(*inputs)
+    for _ in range(3):
+        call()
     torch.cuda.synchronize()
+    steps = 8
+    with profile(activities=activities, record_shapes=True) as prof:
+        for _ in range(steps):
+            call()
+        torch.cuda.synchronize()
+else:
+    with profile(activities=activities, record_shapes=True) as prof:
+        try:
+            runpy.run_path(script, run_name="__main__")
+        except SystemExit as e:  # targets print their result and exit
+            exit_code = int(e.code or 0) if isinstance(e.code, int) or e.code is None else 1
+        torch.cuda.synchronize()
 def _dev_us(e):
     v = getattr(e, "device_time_total", None)   # torch >= 2.4
     if v is None:
@@ -337,7 +362,7 @@ _RUNTIME_ROWS = ("cudaLaunchKernel", "cudaDeviceSynchronize", "cudaStreamSynchro
                  "Lazy Function Loading", "Runtime Triggered Module Loading", "cudaFuncGetAttributes",
                  "cudaModuleGetLoadingMode", "cudaGetDevice", "cudaMalloc", "cudaFree")
 kernels, ops = [], []
-for e in prof.key_averages():
+for e in prof.key_averages(group_by_input_shape=steps is not None):
     us = _dev_us(e)
     if us <= 0:
         continue
@@ -352,12 +377,14 @@ for e in prof.key_averages():
         ops.append(row)
 kernels.sort(key=lambda r: -r["device_time_us"])
 ops.sort(key=lambda r: -r["device_time_us"])
-total = sum(r["device_time_us"] for r in kernels) or 1.0
+total = sum(r["device_time_us"] for r in kernels)
 for r in kernels:
-    r["pct"] = round(100.0 * r["device_time_us"] / total, 2)
+    r["pct"] = round(100.0 * r["device_time_us"] / total, 2) if total else 0.0
 print("HOTKERNEL_JSON " + json.dumps({
     "kernels": kernels[:top], "total_kernel_time_us": round(total, 1), "n_kernels": len(kernels),
-    "ops": ops[:top],
+    "ops": ops[:top], "profiled_calls": steps,
+    "cuda_events": sum(r["calls"] for r in kernels),
+    "tensor_copy_calls": sum(r["calls"] for r in ops if r["name"] == "aten::copy_"),
     "ops_note": "inclusive GPU time per aten op (nested ops overlap; use kernels for shares)",
     "script_exit_code": exit_code, "torch": torch.__version__}))
 '''
@@ -365,10 +392,13 @@ print("HOTKERNEL_JSON " + json.dumps({
 
 @mcp.tool()
 def torch_trace(script: str, top: int = 15, args: list[str] | None = None,
-                cwd: str | None = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
-    """Run a Python script under torch.profiler in the user's interpreter. Returns `kernels`
-    (real GPU kernels by device time, pct over total kernel time) and `ops` (aten ops with
-    input shapes, inclusive time). Works without Nsight installed; use this first."""
+                cwd: str | None = None, timeout: int = _DEFAULT_TIMEOUT,
+                warm: bool = False) -> dict:
+    """Report CUDA kernels and PyTorch ops by device time in the user's interpreter.
+    With warm=True, profile eight calls after setup and warmup. The script exports
+    prepare_profile() returning a no-arg callable, or TARGET and baseline_fn, profile_fn,
+    or a function named after the file. The default profiles the full script.
+    """
     py, err = _python_or_error()
     if err:
         return err
@@ -379,7 +409,7 @@ def torch_trace(script: str, top: int = 15, args: list[str] | None = None,
         # Targets skip their L2-flush scaffolding under this variable so it does not show up
         # as the top kernel; timing tools (bench, verify) never set it.
         r = _run([py, runner, script, str(top), *(args or [])], cwd=cwd, timeout=timeout,
-                 env={"HOTKERNEL_NO_FLUSH": "1"})
+                 env={"HOTKERNEL_NO_FLUSH": "1", "HOTKERNEL_TRACE_WARM": str(int(warm))})
     finally:
         try:
             os.unlink(runner)
@@ -396,9 +426,12 @@ def torch_trace(script: str, top: int = 15, args: list[str] | None = None,
                 k["short_name"] = _short_kernel_name(k["name"])
                 k["name"] = k["name"][:160]
             out["cmd"] = r["cmd"]
-            out["note"] = ("whole-script profile (setup, reference, correctness check, warmup "
-                           "included); the target's L2 flush is disabled here, so use bench()/"
-                           "verify() for timing")
+            out["note"] = (
+                "Warm trace of repeated calls on the prepared inputs. Use verify() for timing."
+                if warm else
+                "Whole-script trace includes setup, reference, correctness checks and warmup. "
+                "Use verify() for timing."
+            )
             return out
     return {"error": "no profiler output found", "stdout_tail": r["stdout"][-2000:]}
 
@@ -836,6 +869,78 @@ def verify(candidate: str, baseline: str, n: int = 7, warmup: int = 2,
     return out
 
 
+@mcp.tool()
+def compare_hub(baseline: str, operation: str | None = None, n: int = 5, warmup: int = 1,
+                args: list[str] | None = None, cwd: str | None = None,
+                timeout: int = _DEFAULT_TIMEOUT) -> dict:
+    """Try the pinned Hub kernels for silu_and_mul or rmsnorm using the baseline's contract.
+    The operation defaults to the baseline filename without _baseline.py. Install kernels
+    in HOTKERNEL_PYTHON. Returns correctness and paired timings for each candidate plus
+    warmed trace comparisons and a next diagnostic check. An unknown operation reports
+    the supported operations.
+    """
+    from .hub import HUB_KERNELS, candidate_script, compare_traces
+
+    base = Path(_local_path(cwd) or Path.cwd())
+    target = (base / (_local_path(baseline) or baseline)).resolve()
+    operation = operation or target.stem.removesuffix("_baseline")
+    if operation not in HUB_KERNELS:
+        return {"error": f"No Hub adapter for {operation!r}",
+                "supported_operations": sorted(HUB_KERNELS)}
+    if not target.is_file():
+        return {"error": f"Baseline file not found: {target}"}
+    if n < 2 or warmup < 0:
+        return {"error": "Use n >= 2 and warmup >= 0"}
+
+    py, err = _python_or_error()
+    if err:
+        return err
+    check_import = (
+        "from importlib.util import find_spec\n"
+        "raise SystemExit(find_spec('kernels') is None)"
+    )
+    probe = _run([py, "-c", check_import], cwd=cwd, timeout=timeout)
+    if "error" in probe:
+        return probe
+    if probe["returncode"]:
+        return {"error": f"Install kernels>=0.18.3 in {py}, the HOTKERNEL_PYTHON interpreter."}
+
+    attempts = []
+    with tempfile.TemporaryDirectory(prefix="hotkernel-hub-") as directory:
+        scripts = {}
+        for name, spec in HUB_KERNELS[operation].items():
+            script = Path(directory) / f"{name}.py"
+            script.write_text(candidate_script(target, operation, name), encoding="utf-8")
+            scripts[name] = str(script)
+            verification = verify(
+                str(script), str(target), n=n, warmup=warmup, args=args, cwd=cwd, timeout=timeout
+            )
+            attempts.append({"name": name, **spec.provenance(), "verification": verification})
+
+        baseline_trace = torch_trace(str(target), args=args, cwd=cwd, timeout=timeout, warm=True)
+        for attempt in attempts:
+            if attempt["verification"].get("verdict") in ("faster", "slower", "inconclusive"):
+                trace = torch_trace(
+                    scripts[attempt["name"]], args=args, cwd=cwd, timeout=timeout, warm=True
+                )
+                attempt["trace"] = trace
+                attempt["diagnosis"] = compare_traces(baseline_trace, trace)
+
+    winner = min(
+        (a for a in attempts if a["verification"].get("verdict") == "faster"),
+        key=lambda a: a["verification"]["candidate"]["mean_ms"],
+        default=None,
+    )
+    return {
+        "status": "compared" if any("verdict" in a["verification"] for a in attempts) else "unavailable",
+        "operation": operation,
+        "baseline": str(target),
+        "baseline_trace": baseline_trace,
+        "candidates": attempts,
+        "recommended": winner["name"] if winner else None,
+    }
+
+
 _LEADERBOARD_INTRO = """# Leaderboard
 
 Every row below is generated by the `record()` tool from the JSON logs in `results/<target>/`;
@@ -1050,12 +1155,27 @@ def main() -> None:
     if argv and argv[0] == "new":
         from .newtarget import main as new_main
         sys.exit(new_main(argv[1:]))
+    if argv and argv[0] == "hub":
+        import argparse
+
+        parser = argparse.ArgumentParser(
+            prog="hotkernel hub", description="Compare pinned Hub kernels with a HotKernel target."
+        )
+        parser.add_argument("baseline")
+        parser.add_argument("--operation", help="Defaults to the name of the baseline target.")
+        parser.add_argument("-n", type=int, default=5, help="Number of measured pairs per candidate.")
+        parser.add_argument("--warmup", type=int, default=1, help="Warmup pairs per candidate.")
+        options = parser.parse_args(argv[1:])
+        result = compare_hub(options.baseline, options.operation, options.n, options.warmup)
+        print(json.dumps(result, indent=2))
+        sys.exit(1 if "error" in result or result["status"] == "unavailable" else 0)
     if argv and argv[0] in ("--version", "-V"):
         print(f"hotkernel {__version__}")
         return
     if argv and argv[0] in ("-h", "--help"):
         print("usage: hotkernel            start the MCP server (stdio)\n"
               "       hotkernel new ...    scaffold a target from your function (see `hotkernel new -h`)\n"
+              "       hotkernel hub ...    compare ready Hub kernels (see hotkernel hub -h)\n"
               "       hotkernel --version")
         return
     mcp.run()

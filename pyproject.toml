@@ -19,6 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+hub = ["kernels>=0.18.3"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]

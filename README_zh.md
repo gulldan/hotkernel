@@ -14,7 +14,7 @@
 
 </div>
 
-今天你让 Claude"把这个 kernel 跑快点"，它只能靠猜：它看不到 Nsight 的报告，不知道哪个 kernel 吃掉了一步的 60%，没读过编译器生成的 SASS，也没法在你的卡上测自己改的版本。hotkernel 就是它缺的那双手。十个工具包住 `nsys`、`ncu`、`cuobjdump`、`torch.profiler` 和一套严格的验证与记录协议；一个 skill 把它们串成循环：剖析、选最耗时的 kernel、读它的 SASS、对照 roofline、用 Triton 重写、对着基线验证、记录裁决、保留或回滚、再来。
+今天你让 Claude"把这个 kernel 跑快点"，它只能靠猜：它看不到 Nsight 的报告，不知道哪个 kernel 吃掉了一步的 60%，没读过编译器生成的 SASS，也没法在你的卡上测自己改的版本。hotkernel 就是它缺的那双手。十一个工具包住 `nsys`、`ncu`、`cuobjdump`、`torch.profiler` 和一套严格的验证与记录协议；一个 skill 把它们串成循环：剖析、选最耗时的 kernel、读它的 SASS、对照 roofline、用 Triton 重写、对着基线验证、记录裁决、保留或回滚、再来。
 
 **五个目标，五次 agent 自主运行，一张 RTX 5090：rmsnorm 比 PyTorch 朴素实现快 3.2 倍，softmax 比 `torch.softmax` 快 1.2 倍，gemv 与 cuBLAS 持平。agent 保留下来的每个 kernel 都跑到了这张卡实测流式带宽的 95% 到 105%。库函数本来就贴近天花板的地方（cuDNN 解码注意力、tinygemm 的 int4 矩阵向量乘），agent 什么也没找到，自己停了下来，排行榜如实记着。**¹
 
@@ -82,10 +82,18 @@ hotkernel new gelu --from torch.nn.functional:gelu --shape 4096x8192 --dtype bf1
 | `disasm` | 给 cubin 或 Triton 缓存里最新的同名 kernel 出 PTX 或 SASS | `cuobjdump` |
 | `bench` | 把脚本跑 n 次，收集它打印的 `{"ms": …, "ok": …}`，返回均值、标准差、最小值 | 你的 torch |
 | `verify` | 基线和候选交替各跑 n 次；给出加速比和裁决：`faster`、`slower`、`inconclusive`、`incorrect`（任一次 `ok=false`，不报加速比）、`invalid`（shape、dtype、种子或计时协议被改） | 你的 torch |
+| `compare_hub` | 核对并测量固定版本的 Hub kernel，比较预热后的 CUDA trace | 你的 torch + kernels |
 | `record` | 把 verify 结果写到 `results/<目标>/`，从日志重新生成排行榜，并告诉 agent 这次改动是否超过本轮最好成绩 | 无 |
 | `new_target` | 用你自己的函数生成目标：基线、空白候选和随附的契约文件，与 `hotkernel new` 相同 | 无 |
 
 `torch_trace`、`bench`、`verify`、`record` 在任何装了 PyTorch 的机器上都能用。Nsight 是可选的，只是让图更清楚。
+
+## 对比 Hugging Face Hub 的 kernel
+
+在运行 PyTorch 样例的 Python 环境里安装 `kernels>=0.18.3`，再运行
+`uv run hotkernel hub examples/silu_and_mul_baseline.py -n 7`。也可以调用 MCP 工具
+`compare_hub`。当前支持 `silu_and_mul` 与 `rmsnorm`。工具使用固定的 Hub revision，
+按基准的规则检查正确性并交错计时，再比较预热后的 CUDA trace。
 
 ## 循环
 
