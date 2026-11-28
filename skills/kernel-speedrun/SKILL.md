@@ -6,7 +6,7 @@ description: Overnight loop that makes one GPU kernel faster on the GPU in this 
 # kernel-speedrun
 
 You have the `hotkernel` MCP tools: `gpu_info`, `roofline`, `bench`, `torch_trace`, `profile`,
-`top_kernels`, `disasm`, `verify`, `record`, and `new_target` (scaffold a target from the
+`top_kernels`, `disasm`, `verify`, `compare_hub`, `record`, and `new_target` (scaffold a target from the
 user's own function). This skill is the loop that turns them into a speedup that someone else
 can reproduce. If the user's kernel has no target yet, start with
 `new_target(target, from_="module:function", shape="4096x8192", dtype="bf16")` and bench the
@@ -41,6 +41,10 @@ baseline it writes; the generated candidate is the file you edit.
 
 1. `gpu_info()` once. Note card, driver, power limit. `roofline()` for the ridge point.
 2. `bench(baseline, n=5)` to see the number to beat and its noise. Write it in your notes.
+   When `compare_hub` is available for a `silu_and_mul` or `rmsnorm` target, call `compare_hub(baseline)` before
+   writing a candidate. Use the paired timings to choose a ready implementation and the warm
+   traces to pick a follow-up check. If the Hub call reports an unavailable kernel or package,
+   continue with the local baseline. A ready kernel still follows the same correctness gate.
 3. Find the hot kernel: `torch_trace(baseline)` (always works), or `profile(cmd, tool="nsys")`
    for a kernel timeline and `profile(cmd, tool="ncu", ncu_kernel_regex=...)` for achieved
    occupancy and DRAM / SM throughput of one kernel. `top_kernels(csv, tool=...)` re-reads a

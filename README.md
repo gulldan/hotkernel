@@ -14,7 +14,7 @@ English | [中文](https://github.com/xinhuagu/hotkernel/blob/main/README_zh.md)
 
 </div>
 
-Ask Claude to "make this kernel faster" today and it guesses: it cannot see the Nsight report, does not know which kernel eats 60% of the step, has never read the SASS the compiler produced, and cannot benchmark its own rewrite on your card. hotkernel is the missing pair of hands. Ten tools wrap `nsys`, `ncu`, `cuobjdump`, `torch.profiler` and a strict verify-and-record contract; one skill turns them into a loop: profile, pick the hot kernel, read its SASS, check it against the roofline, rewrite it in Triton, verify against the baseline, record the verdict, keep or revert, repeat.
+Ask Claude to "make this kernel faster" today and it guesses: it cannot see the Nsight report, does not know which kernel eats 60% of the step, has never read the SASS the compiler produced, and cannot benchmark its own rewrite on your card. hotkernel is the missing pair of hands. Eleven tools wrap `nsys`, `ncu`, `cuobjdump`, `torch.profiler` and a strict verify-and-record contract; one skill turns them into a loop: profile, pick the hot kernel, read its SASS, check it against the roofline, rewrite it in Triton, verify against the baseline, record the verdict, keep or revert, repeat.
 
 **Five targets, five autonomous agent runs, one RTX 5090: rmsnorm 3.2× faster than eager PyTorch, softmax 1.2× faster than `torch.softmax`, gemv level with cuBLAS. Every kernel the agent kept runs at 95–105% of the card's measured streaming bandwidth. Where the library already sat near that ceiling (cuDNN decode attention, tinygemm int4 GEMV), the agent found nothing, stopped on its own, and the board says so.**¹
 
@@ -52,6 +52,35 @@ hotkernel new gelu --from torch.nn.functional:gelu --shape 4096x8192 --dtype bf1
 
 writes `targets/gelu_baseline.py`, `targets/gelu_candidate.py` (starts as the baseline; this is the file the loop edits) and `targets/_hotkernel_contract.py`. A function of your own works the same way, with extra inputs in call order: `--from ./mykernels.py:fused --extra w:8192`. Then `bench` the baseline for the number to beat, and `verify` the untouched candidate against it, which must come back `inconclusive` before anything changed. Agents get the same through the `new_target` tool. On the reference card the untouched gelu candidate benched at 0.0952 ms and verified `inconclusive`; a deliberately wrong one came back `incorrect`.
 
+## Compare kernels from Hugging Face
+
+`compare_hub` tries the supported kernels from Hugging Face in the same benchmark as your
+baseline. It pins each Hub revision, uses the target's correctness check and timing contract,
+and recommends the fastest observed candidate with a `faster` verdict. Warm traces show the
+dominant kernels, CUDA activity, and extra Torch copies to investigate.
+
+Install `kernels` in the interpreter that runs your PyTorch targets.
+
+```bash
+export HOTKERNEL_PYTHON=/path/to/torch/bin/python
+uv pip install --python "$HOTKERNEL_PYTHON" 'kernels>=0.18.3'
+uv run hotkernel hub examples/silu_and_mul_baseline.py -n 7
+```
+
+The MCP call is `compare_hub(baseline="examples/silu_and_mul_baseline.py", n=7)`. The catalog
+supports `silu_and_mul` (packed gate and values along the last dimension) and `rmsnorm` (input
+and weight, with `EPS` in the baseline). The baseline exports `TARGET` and `run(fn, impl, extra)`.
+The operation comes from the baseline filename by default. Use `--operation` or the MCP
+`operation` argument when the file has another name. The Hub extra in the checkout is also
+available when the server and Torch use the same interpreter.
+
+Use `uv run --project /path/to/hotkernel hotkernel` as the MCP server command for this
+checkout. The Hub tool runs in `HOTKERNEL_PYTHON`.
+
+`torch_trace(..., warm=True)` captures eight calls on prepared inputs after warmup. A custom
+script can export `prepare_profile()` returning a no-argument callable to prepare a model or
+pipeline before tracing. Use `verify()` for the standalone timings.
+
 ## Before / after
 
 All rows: RTX 5090 @ 575 W, bf16, timing protocol 3, n=7 per `verify()`; rows with a win are three independent reproductions.
@@ -82,6 +111,7 @@ Every row on [LEADERBOARD.md](https://github.com/xinhuagu/hotkernel/blob/main/LE
 | `disasm` | PTX or SASS of a cubin, or of the latest Triton-cache kernel by name | `cuobjdump` |
 | `bench` | run a script n times, collect its `{"ms": …, "ok": …}` line, return mean/std/min | your torch |
 | `verify` | run baseline and candidate interleaved, n times each; speedup and a verdict: `faster`, `slower`, `inconclusive`, `incorrect` (any `ok=false`, no speedup reported), `invalid` (shape, dtype, seed or timing protocol changed) | your torch |
+| `compare_hub` | verify pinned Hub kernels and profile warmed calls | your torch + kernels |
 | `record` | write the verify result to `results/<target>/`, regenerate the leaderboard from the logs, and say whether the change beats the run's best so far | nothing |
 | `new_target` | scaffold a target from your own function: baseline, blank candidate and the vendored contract, the same as `hotkernel new` | nothing |
 
